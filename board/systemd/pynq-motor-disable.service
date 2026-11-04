@@ -1,0 +1,14 @@
+[Unit]
+Description=Load robot motor overlay and actively disable 4 motors (PWM low) at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/share/pynq-venv/bin/python3 /home/xilinx/jupyter_notebooks/motor_disable_boot.py
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

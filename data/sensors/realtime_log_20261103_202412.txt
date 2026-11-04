@@ -1,0 +1,6 @@
+=== collect_all 最新版全量采集 ===
+loading overlay ...
+scan: 0x29 0x40 0x69
+IMU @0x69 who=0x47 |a|=1.0069g acc_noise=0.92mg gyro_bias=(+0.19,+1.05,-0.71)dps temp=18.3C n=200 fails=0
+TOF @0x29 model=0xEA 0xCC 0x10 valid=50/50 mean=56.3mm std=1.6278820596099706mm
+BATTERY @0x40: 11.656V  71%  (samples=['11.652', '11.660', '11.660', '11.660', '11.628', '11.664', '11.660', '11.664'])

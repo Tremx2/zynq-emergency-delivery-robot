@@ -1,0 +1,36 @@
+{
+  "face": "left",
+  "desc": "左侧朝上（右侧着地）",
+  "time": "2025-05-05 07:35:12",
+  "n": 1000,
+  "fails": 0,
+  "duration_s": 10.0,
+  "rate_hz": 100.0,
+  "acc_mean_g": [
+    -0.997852,
+    -0.003227,
+    0.023101
+  ],
+  "acc_std_g": [
+    0.001473,
+    0.001251,
+    0.004723
+  ],
+  "gyro_mean_dps": [
+    0.19211,
+    1.1122,
+    -0.6864
+  ],
+  "gyro_std_dps": [
+    0.09568,
+    0.61836,
+    0.07425
+  ],
+  "temp_c": 18.82,
+  "norm_g": 0.998125,
+  "dominant": "X-",
+  "tilt_from_axis_deg": 1.339,
+  "still_ok": false,
+  "posture_ok": true,
+  "raw_csv": "face_left_raw.csv"
+}

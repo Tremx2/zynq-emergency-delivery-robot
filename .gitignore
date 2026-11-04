@@ -1,0 +1,39 @@
+# ---------------- Vivado: generated project / outputs (rebuild with build/*.tcl)
+build/vivado/
+build/output/
+build/*.log
+build/*.jou
+.Xil/
+*.cache/
+*.runs/
+*.gen/
+*.sim/
+*.hw/
+*.ip_user_files/
+*.jou
+*.log
+*.str
+*.pb
+*.wdb
+*.dcp
+vivado*.backup.*
+# reference reports are tracked
+!build/reports/*.rpt
+
+# ---------------- Python / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+sim/navigation_sim/metrics/
+
+# ---------------- OS / editor / temp
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*

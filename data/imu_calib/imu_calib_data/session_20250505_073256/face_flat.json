@@ -1,0 +1,36 @@
+{
+  "face": "flat",
+  "desc": "放平（四轮着地）",
+  "time": "2025-05-05 07:34:04",
+  "n": 1000,
+  "fails": 0,
+  "duration_s": 10.0,
+  "rate_hz": 100.0,
+  "acc_mean_g": [
+    -0.009239,
+    0.002499,
+    -1.006183
+  ],
+  "acc_std_g": [
+    0.004269,
+    0.003829,
+    0.004542
+  ],
+  "gyro_mean_dps": [
+    0.1907,
+    1.07018,
+    -0.68079
+  ],
+  "gyro_std_dps": [
+    0.20942,
+    0.04945,
+    0.19931
+  ],
+  "temp_c": 18.79,
+  "norm_g": 1.006228,
+  "dominant": "Z-",
+  "tilt_from_axis_deg": 0.545,
+  "still_ok": true,
+  "posture_ok": true,
+  "raw_csv": "face_flat_raw.csv"
+}

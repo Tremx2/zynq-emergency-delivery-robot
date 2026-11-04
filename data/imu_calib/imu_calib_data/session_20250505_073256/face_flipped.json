@@ -1,0 +1,36 @@
+{
+  "face": "flipped",
+  "desc": "倒扣（四轮朝天）",
+  "time": "2025-05-05 07:44:05",
+  "n": 1000,
+  "fails": 0,
+  "duration_s": 10.0,
+  "rate_hz": 100.0,
+  "acc_mean_g": [
+    0.025906,
+    -0.052041,
+    0.9933
+  ],
+  "acc_std_g": [
+    0.004243,
+    0.003036,
+    0.004768
+  ],
+  "gyro_mean_dps": [
+    0.18834,
+    1.03253,
+    -0.68956
+  ],
+  "gyro_std_dps": [
+    0.32252,
+    0.51158,
+    0.17188
+  ],
+  "temp_c": 19.6,
+  "norm_g": 0.995,
+  "dominant": "Z+",
+  "tilt_from_axis_deg": 3.349,
+  "still_ok": false,
+  "posture_ok": true,
+  "raw_csv": "face_flipped_raw.csv"
+}

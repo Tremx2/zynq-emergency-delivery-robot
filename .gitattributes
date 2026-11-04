@@ -1,0 +1,6 @@
+# Keep LF everywhere (scripts run on the Linux board); Windows batch files use CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.bit binary
+*.docx binary
+*.png binary

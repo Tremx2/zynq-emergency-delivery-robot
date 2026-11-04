@@ -1,0 +1,36 @@
+{
+  "face": "rear",
+  "desc": "车尾朝上（车头着地竖立）",
+  "time": "2025-05-05 07:39:34",
+  "n": 1000,
+  "fails": 0,
+  "duration_s": 10.0,
+  "rate_hz": 100.0,
+  "acc_mean_g": [
+    -0.079689,
+    0.986465,
+    -0.111432
+  ],
+  "acc_std_g": [
+    0.007958,
+    0.003901,
+    0.010968
+  ],
+  "gyro_mean_dps": [
+    0.31406,
+    1.17482,
+    -0.77763
+  ],
+  "gyro_std_dps": [
+    0.78608,
+    1.21915,
+    0.76142
+  ],
+  "temp_c": 19.08,
+  "norm_g": 0.995932,
+  "dominant": "Y+",
+  "tilt_from_axis_deg": 7.906,
+  "still_ok": false,
+  "posture_ok": true,
+  "raw_csv": "face_rear_raw.csv"
+}

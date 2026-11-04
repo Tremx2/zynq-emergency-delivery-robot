@@ -1,0 +1,393 @@
+# Generates watchdog_timeout_test.ipynb
+import json, sys
+
+cells = []
+def md(s): cells.append({"cell_type": "markdown", "metadata": {}, "source": s.strip("\n")})
+def code(s): cells.append({"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [], "source": s.strip("\n")})
+
+md(r"""
+# FPGA 硬件看门狗超时断电测试（软件时间戳）
+
+用 PS 端高速轮询看门狗状态寄存器，给每个关键事件打 `perf_counter_ns` 时间戳，测量
+**"最后一次有效心跳 → FPGA 切断 PWM"** 的时间（理论 62 500 000 时钟 = **500.000 ms**），以及断电后车轮停转时间、滑行距离。
+
+| 测试 | 模拟的失效 | 次数 |
+|---|---|---|
+| 预检查 | 无其他进程喂狗；**停车互锁**：车轮转动时布防请求应被硬件拒绝 | 1 |
+| A 停止心跳 | 控制程序卡死 / 停止喂狗 | `N_STOP` |
+| B kill -9 | 控制进程被强杀（软件崩溃） | `N_KILL` |
+| C 错误魔数 | 软件跑飞，向心跳寄存器写错误的值 | `N_BADMAGIC` |
+
+**RTL 依据**：超时那一拍 `wd_fault←1, wd_armed←0`，`rpwm/lpwm = raw & wd_motor_ok` 同拍被门控；下一拍 PID 输出寄存器清零。
+所以软件看到 `0x48` 的 fault 位 = 引脚已断电（时间分辨率 = 两次轮询的间隔，约几十 µs）。
+
+### ⚠️ 安全
+- **车轮必须架空**（车体垫起来，四轮离地）。每次测试车轮会以低速转 2 s，然后被看门狗切断、自由滑行停下。
+- 急停：工具栏 ■。即使程序中断，看门狗也会在 500 ms 内断电。
+- 运行前请**关掉其他正在使用底盘的 notebook 内核**（否则别的进程在喂狗，预检查会报错）。
+""")
+
+code(r"""
+# ===== 1. 参数 =====
+SPEED      = 30      # 车轮目标速度 (counts/10ms)，低速
+RUN_S      = 2.0     # 每次先正常运行(有心跳)的时间
+HB_PERIOD  = 0.05    # 正常心跳周期 50 ms
+POST_S     = 1.5     # 断电后继续记录的时间（看滑行停转）
+LOG_DT     = 0.005   # 完整寄存器快照的记录周期 5 ms（状态寄存器则全速轮询）
+PAUSE_S    = 1.0     # 两次测试之间的间隔
+N_STOP     = 10      # A 停止心跳 次数
+N_KILL     = 5       # B kill -9 次数
+N_BADMAGIC = 3       # C 错误魔数 次数
+BAD_MAGIC  = 0x12345678
+""")
+
+code(r"""
+# ===== 2. 初始化（不会让车动） =====
+import os, sys, time, math, json, csv, signal, multiprocessing as mp
+os.environ["XILINX_XRT"] = "/usr"; os.environ["BOARD"] = "Pynq-Z2"
+NB_DIR = "/home/xilinx/jupyter_notebooks"
+if NB_DIR not in sys.path: sys.path.insert(0, NB_DIR)
+import numpy as np
+from pynq import Overlay, MMIO, PL
+
+BIT = os.path.join(NB_DIR, "robot_system_wrapper.bit")
+BASE = 0x43C00000
+ENABLE, TGT, SPD, POS, PWM = 0x00, [0x04, 0x08, 0x0C, 0x10], [0x14, 0x18, 0x1C, 0x20], [0x24, 0x28, 0x2C, 0x30], [0x34, 0x38, 0x3C, 0x40]
+WD_HB, WD_ST, WD_ARM = 0x44, 0x48, 0x4C
+HB_MAGIC, ARM_MAGIC = 0xC0DEC0DE, 0xA5C35A3C
+CPM = 18061.0 / 1020.0                      # counts / mm
+WHEELS = ["M1 右前", "M2 右后", "M3 左后", "M4 左前"]
+SIGN = np.array([-1, -1, 1, 1])             # 前进方向
+
+if PL.bitfile_name and os.path.basename(PL.bitfile_name) == os.path.basename(BIT):
+    Overlay(BIT, download=False); print("overlay 已加载，复用")
+else:
+    Overlay(BIT); print("overlay 已加载")
+m = MMIO(BASE, 0x1000)
+
+def s32(v): return v - (1 << 32) if v & 0x80000000 else v
+def wr_s32(a, v): m.write(a, int(v) & 0xFFFFFFFF)
+def now(): return time.perf_counter_ns()      # Linux: CLOCK_MONOTONIC，跨进程同一时基
+def wd(): st = m.read(WD_ST); return bool(st & 1), bool(st & 2)
+def stop_and_arm():
+    m.write(ENABLE, 0)
+    for a in TGT: wr_s32(a, 0)
+    m.write(WD_ARM, ARM_MAGIC)
+    return wd()
+def fresh_arm():
+    # RTL: 已布防时再写布防魔数会被忽略、计时器不清零。所以先等当前布防超时，再重新布防，保证从 0 开始计时
+    if wd()[0]:
+        m.write(ENABLE, 0)
+        for a_ in TGT: wr_s32(a_, 0)
+        t_ = now()
+        while wd()[0] and now() - t_ < 0.7e9: pass
+    a_, f_ = stop_and_arm()
+    return now(), a_, f_
+def start_wheels():
+    for a, v in zip(TGT, [-SPEED, -SPEED, SPEED, SPEED]): wr_s32(a, v)
+    m.write(ENABLE, 0x0F)
+def snapshot():
+    return ([s32(m.read(a)) for a in SPD], [s32(m.read(a)) for a in POS], [s32(m.read(a)) for a in PWM])
+
+armed, fault = stop_and_arm()
+print(f"停车并布防: armed={armed} fault={fault}")
+assert armed and not fault, "布防失败"
+
+# 测一下单次寄存器读的耗时（决定时间分辨率）
+t0 = now()
+for _ in range(2000): m.read(WD_ST)
+print(f"单次 0x48 读耗时 ≈ {(now() - t0) / 2000 / 1000:.1f} µs")
+""")
+
+md(r"""
+### 3. 预检查（车轮会短暂转动约 1 s，确认已架空）
+""")
+
+code(r"""
+# ===== 3. 预检查 =====
+pre = {}
+# (1) 没有其他进程在喂狗：布防后不写心跳，应在 ~500ms 超时
+t_arm, _, _ = fresh_arm()
+while True:
+    a, f = wd()
+    if f or now() - t_arm > 1.5e9: break
+pre["no_other_feeder"] = f
+pre["idle_timeout_ms"] = (now() - t_arm) / 1e6
+print(f"[1] 布防后不喂狗 → {'超时断电' if f else '未超时'}，{pre['idle_timeout_ms']:.2f} ms")
+if not f:
+    raise RuntimeError("1.5 s 内看门狗没有超时：有其他进程/内核在喂狗。请关闭其他使用底盘的 notebook 内核后重试。")
+
+# (2) 停车互锁：车轮转动时（enable=1、目标≠0）写布防魔数，硬件应拒绝
+fresh_arm(); start_wheels()
+t_end = time.monotonic() + 1.0
+while time.monotonic() < t_end:
+    m.write(WD_HB, HB_MAGIC); time.sleep(0.05)
+m.write(WD_HB, HB_MAGIC)
+spd_running = snapshot()[0]
+t_last = now()
+# 等它超时（不喂狗），超时后保持 enable=1/目标≠0，尝试重新布防
+while not wd()[1]:
+    if now() - t_last > 1e9: break
+m.write(WD_ARM, ARM_MAGIC)
+a, f = wd()
+pre["interlock_refused"] = (not a) and f
+print(f"[2] 运行中速度 {spd_running}；超时后在 enable=1 状态下写布防魔数 → armed={a} fault={f} "
+      f"→ {'被拒绝（互锁有效）' if pre['interlock_refused'] else '被接受（异常！）'}")
+a, f = stop_and_arm()
+print(f"    停车后再布防 → armed={a} fault={f}")
+time.sleep(1.5)
+""")
+
+md(r"""
+### 4. 正式测试 A / B / C（车轮会反复转动 2 s 再被切断，共约 1 分钟）
+""")
+
+code(r"""
+# ===== 4. 测试 A / B / C =====
+LOG_COLS = ["trial", "t_rel_ms", "armed", "fault"] + [f"spd{i+1}" for i in range(4)] + [f"pos{i+1}" for i in range(4)] + [f"pwm{i+1}" for i in range(4)]
+logs = []          # 全部快照
+trials = []        # 每次测试结果
+
+def child_driver(last_hb):
+    # B 测试的子进程：只负责喂狗，并把每次心跳时间写入共享内存
+    mm = MMIO(BASE, 0x1000)
+    while True:
+        mm.write(WD_HB, HB_MAGIC)
+        last_hb.value = time.perf_counter_ns()
+        time.sleep(HB_PERIOD)
+
+def monitor_cutoff(trial_id, t_ref_fn, hb_write=None):
+    # 全速轮询 0x48 直到 fault；每 LOG_DT 记录一次完整快照。返回 (检测时刻, 前一次轮询时刻, 检测时 PWM)
+    prev = now(); last_full = 0; rows = []
+    while True:
+        if hb_write is not None:                        # C 测试：持续写错误魔数
+            hb_write()
+        st = m.read(WD_ST); t = now()
+        if st & 2:
+            spd, pos, pwm = snapshot()
+            rows.append((t, st, spd, pos, pwm))
+            return t, prev, pwm, rows
+        if t - last_full >= LOG_DT * 1e9:
+            spd, pos, pwm = snapshot(); rows.append((t, st, spd, pos, pwm)); last_full = now(); t = last_full
+        prev = t
+        if t - t_ref_fn() > 3e9:
+            raise RuntimeError("3 s 未检测到断电")
+
+def run_trial(kind, idx):
+    trial_id = len(trials)
+    _, a, f = fresh_arm()
+    assert a and not f, f"第 {trial_id} 次布防失败"
+    rows = []
+    start_wheels()
+    t_kill = None; child = None
+    if kind == "B":
+        last_hb = mp.Value("q", now())
+        child = mp.get_context("fork").Process(target=child_driver, args=(last_hb,), daemon=True)
+        child.start()
+    t_run_end = time.monotonic() + RUN_S; last = 0
+    t_hb = now()
+    while time.monotonic() < t_run_end:                  # 正常运行阶段
+        if kind != "B" and now() - last >= HB_PERIOD * 1e9:
+            m.write(WD_HB, HB_MAGIC); t_hb = now(); last = t_hb
+        spd, pos, pwm = snapshot(); rows.append((now(), m.read(WD_ST), spd, pos, pwm))
+        time.sleep(LOG_DT)
+    if kind == "A":
+        m.write(WD_HB, HB_MAGIC); t_hb = now()          # 最后一次有效心跳
+        t_det, t_prev, pwm_det, r2 = monitor_cutoff(trial_id, lambda: t_hb)
+    elif kind == "B":
+        os.kill(child.pid, signal.SIGKILL); t_kill = now()
+        t_det, t_prev, pwm_det, r2 = monitor_cutoff(trial_id, lambda: t_kill)
+        child.join(1.0)
+        t_hb = last_hb.value                             # 子进程最后一次心跳（写共享内存前已写寄存器）
+    else:
+        m.write(WD_HB, HB_MAGIC); t_hb = now()          # 最后一次有效心跳，之后只写错误魔数
+        t_det, t_prev, pwm_det, r2 = monitor_cutoff(trial_id, lambda: t_hb, hb_write=lambda: m.write(WD_HB, BAD_MAGIC))
+    rows += r2
+    pwm_before = rows[-2][4] if len(rows) >= 2 else None
+    # 断电后继续记录，观察滑行
+    t_post = time.monotonic() + POST_S
+    while time.monotonic() < t_post:
+        spd, pos, pwm = snapshot(); rows.append((now(), m.read(WD_ST), spd, pos, pwm)); time.sleep(LOG_DT)
+    stop_and_arm()
+
+    # --- 指标 ---
+    lat_ms = (t_det - t_hb) / 1e6                        # 最后心跳 → 检测到断电
+    res_ms = (t_det - t_prev) / 1e6                      # 时间分辨率（真实断电落在 [prev, det] 内）
+    t_rel = lambda t: (t - t_hb) / 1e6
+    after = [r for r in rows if r[0] >= t_det]
+    stop_t = next((t_rel(r[0]) for r in after if all(v == 0 for v in r[2])), float("nan"))
+    pos_det = np.array(after[0][3]); pos_end = np.array(after[-1][3])
+    coast_mm = float(np.mean(np.abs((pos_end - pos_det) * SIGN)) / CPM)
+    trials.append(dict(trial=trial_id, kind=kind, idx=idx,
+                       timeout_ms=lat_ms, resolution_ms=res_ms,
+                       kill_to_cut_ms=((t_det - t_kill) / 1e6 if t_kill else None),
+                       pwm_before=list(pwm_before) if pwm_before else None, pwm_at_cut=list(pwm_det),
+                       pwm_zero_at_cut=all(v == 0 for v in pwm_det),
+                       spd_before=list(rows[-2][2]) if len(rows) >= 2 else None,
+                       stop_after_hb_ms=stop_t, coast_ms=stop_t - lat_ms, coast_mm=coast_mm))
+    for r in rows:
+        logs.append([trial_id, t_rel(r[0]), r[1] & 1, (r[1] >> 1) & 1, *r[2], *r[3], *r[4]])
+    name = {"A": "停止心跳", "B": "kill -9", "C": "错误魔数"}[kind]
+    extra = f" | kill→断电 {trials[-1]['kill_to_cut_ms']:.2f} ms" if t_kill else ""
+    print(f"  {name} #{idx+1}: 最后心跳→断电 {lat_ms:8.3f} ms (±{res_ms*1000:.0f} µs) | PWM 清零={trials[-1]['pwm_zero_at_cut']} "
+          f"| 断电→停转 {trials[-1]['coast_ms']:.0f} ms, 滑行 {coast_mm:.1f} mm{extra}")
+    time.sleep(PAUSE_S)
+
+try:
+    print("A 停止心跳"); [run_trial("A", i) for i in range(N_STOP)]
+    print("B kill -9 控制进程"); [run_trial("B", i) for i in range(N_KILL)]
+    print("C 错误心跳魔数"); [run_trial("C", i) for i in range(N_BADMAGIC)]
+    print("全部完成")
+except KeyboardInterrupt:
+    print("!! 手动中断")
+finally:
+    stop_and_arm()
+    print("已停车并重新布防，看门狗状态:", wd())
+""")
+
+md(r"""
+### 5. 结果
+""")
+
+code(r"""
+# ===== 5. 结果表 =====
+from IPython.display import HTML, display
+if not trials: raise RuntimeError("没有测试数据")
+css = ("<style>.wt td,.wt th{padding:4px 10px;border-bottom:1px solid #e3e2de;text-align:right;font-size:13px}"
+       ".wt th{background:#f0efec;color:#0b0b0b}.wt td:first-child,.wt th:first-child{text-align:left}</style>")
+NAME = {"A": "A 停止心跳", "B": "B kill -9", "C": "C 错误魔数"}
+summary = []
+for k in ["A", "B", "C"]:
+    ts = [t for t in trials if t["kind"] == k]
+    if not ts: continue
+    lat = np.array([t["timeout_ms"] for t in ts]); res = np.array([t["resolution_ms"] for t in ts])
+    summary.append(dict(测试=NAME[k], 次数=len(ts), 平均_ms=lat.mean(), 标准差_ms=lat.std(), 最小_ms=lat.min(), 最大_ms=lat.max(),
+                        相对理论偏差_ms=lat.mean() - 500.0, 平均分辨率_us=res.mean() * 1000,
+                        PWM同时清零=f"{sum(t['pwm_zero_at_cut'] for t in ts)}/{len(ts)}",
+                        断电到停转_ms=np.nanmean([t["coast_ms"] for t in ts]), 滑行距离_mm=np.mean([t["coast_mm"] for t in ts]),
+                        kill到断电_ms=(np.mean([t["kill_to_cut_ms"] for t in ts]) if k == "B" else None)))
+def f(v, d=3):
+    if v is None: return "—"
+    if isinstance(v, (float, np.floating)): return "—" if math.isnan(v) else f"{v:.{d}f}"
+    return str(v)
+keys = list(summary[0].keys())
+h = css + "<table class='wt'><tr>" + "".join(f"<th>{k.replace('_', ' ')}</th>" for k in keys) + "</tr>"
+for s in summary: h += "<tr>" + "".join(f"<td>{f(s[k])}</td>" for k in keys) + "</tr>"
+display(HTML("<h4>表1 看门狗超时断电汇总（理论 500.000 ms）</h4>" + h + "</table>"))
+
+h = css + "<table class='wt'><tr><th>#</th><th>测试</th><th>最后心跳→断电 ms</th><th>分辨率 µs</th><th>kill→断电 ms</th><th>断电前 PWM</th><th>断电时 PWM</th><th>断电→停转 ms</th><th>滑行 mm</th></tr>"
+for t in trials:
+    h += (f"<tr><td>{t['trial']+1}</td><td>{NAME[t['kind']]}</td><td>{t['timeout_ms']:.3f}</td><td>{t['resolution_ms']*1000:.0f}</td>"
+          f"<td>{f(t['kill_to_cut_ms'], 2)}</td><td>{t['pwm_before']}</td><td>{t['pwm_at_cut']}</td><td>{f(t['coast_ms'], 0)}</td><td>{t['coast_mm']:.1f}</td></tr>")
+display(HTML("<h4>表2 每次测试明细</h4>" + h + "</table>"))
+print(f"预检查：无其他喂狗进程={pre['no_other_feeder']}（空闲超时 {pre['idle_timeout_ms']:.2f} ms）；停车互锁拒绝布防={pre['interlock_refused']}")
+allv = np.array([t["timeout_ms"] for t in trials])
+print(f"全部 {len(allv)} 次：{allv.mean():.3f} ± {allv.std():.3f} ms（范围 {allv.min():.3f} ~ {allv.max():.3f}），理论 500.000 ms")
+""")
+
+code(r"""
+# ===== 6. 图 =====
+%matplotlib inline
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+for fp in ["/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"]:
+    if os.path.exists(fp):
+        font_manager.fontManager.addfont(fp)
+        plt.rcParams["font.sans-serif"] = [font_manager.FontProperties(fname=fp).get_name(), "DejaVu Sans"]
+plt.rcParams.update({"axes.unicode_minus": False, "figure.facecolor": "#fcfcfb", "axes.facecolor": "#fcfcfb",
+    "axes.edgecolor": "#b5b4ad", "axes.labelcolor": "#52514e", "xtick.color": "#52514e", "ytick.color": "#52514e",
+    "axes.grid": True, "grid.color": "#e3e2de", "grid.linewidth": 0.8, "axes.spines.top": False, "axes.spines.right": False,
+    "lines.linewidth": 2, "legend.frameon": False, "font.size": 10, "axes.titlesize": 12, "axes.titleweight": "bold", "axes.titlecolor": "#0b0b0b"})
+WC = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]          # M1..M4 / A B C 固定顺序
+KC = {"A": "#2a78d6", "B": "#eb6834", "C": "#1baf7a"}
+L = np.array(logs, dtype=float); C = {c: i for i, c in enumerate(LOG_COLS)}
+figs = {}
+
+# 图1：代表性一次（A 第 1 次）的断电时序
+tr = next(t for t in trials if t["kind"] == "A") if any(t["kind"] == "A" for t in trials) else trials[0]
+sel = L[:, C["trial"]] == tr["trial"]; x = L[sel, C["t_rel_ms"]]
+fig, ax = plt.subplots(3, 1, figsize=(12, 8), sharex=True, gridspec_kw=dict(height_ratios=[3, 3, 1.2]))
+for i in range(4):
+    ax[0].plot(x, L[sel, C[f"spd{i+1}"]] * SIGN[i], color=WC[i], label=WHEELS[i])
+    ax[1].plot(x, L[sel, C[f"pwm{i+1}"]] * SIGN[i], color=WC[i], label=WHEELS[i])
+ax[2].step(x, L[sel, C["armed"]], where="post", color="#2a78d6", label="armed")
+ax[2].step(x, L[sel, C["fault"]], where="post", color="#d03b3b", label="fault")
+for a in ax:
+    a.axvline(0, color="#52514e", lw=1, ls="--"); a.axvline(tr["timeout_ms"], color="#d03b3b", lw=1, ls="--")
+ax[0].annotate("最后一次心跳", (0, 1.02), xycoords=("data", "axes fraction"), ha="center", fontsize=9, color="#52514e")
+ax[0].annotate(f"硬件断电 {tr['timeout_ms']:.3f} ms", (tr["timeout_ms"], 1.02), xycoords=("data", "axes fraction"), ha="left", fontsize=9, color="#d03b3b")
+ax[0].set_ylabel("车轮速度\n(counts/10ms)"); ax[1].set_ylabel("PID 输出 / PWM"); ax[2].set_ylabel("看门狗"); ax[2].set_yticks([0, 1])
+ax[2].set_xlabel("相对最后一次心跳的时间 (ms)")
+ax[0].legend(ncol=4, loc="upper right"); ax[2].legend(ncol=2, loc="center left")
+ax[0].set_xlim(-400, tr["timeout_ms"] + POST_S * 1000)
+fig.suptitle("图1  停止心跳后的断电时序（单次）", fontweight="bold"); fig.tight_layout()
+figs["fig1_cutoff_timeline"] = fig; plt.show()
+
+# 图2：各次测试的超时时间（理论 500 ms）
+fig, ax = plt.subplots(figsize=(11, 4))
+for k in ["A", "B", "C"]:
+    ts = [t for t in trials if t["kind"] == k]
+    if ts:
+        ax.errorbar([t["trial"] + 1 for t in ts], [t["timeout_ms"] for t in ts], yerr=[t["resolution_ms"] for t in ts],
+                    fmt="o", ms=8, color=KC[k], mec="#fcfcfb", mew=2, capsize=3, label=NAME[k])
+ax.axhline(500.0, color="#52514e", lw=1, ls="--"); ax.annotate("理论 500.000 ms", (0.01, 500.0), xycoords=("axes fraction", "data"), xytext=(0, 4), textcoords="offset points", fontsize=9, color="#52514e")
+ax.set_xlabel("测试序号"); ax.set_ylabel("最后心跳 → 断电 (ms)"); ax.set_title("图2  各次测试的看门狗超时时间")
+ax.legend(ncol=3, loc="upper right"); fig.tight_layout(); figs["fig2_timeouts"] = fig; plt.show()
+
+# 图3：断电后停转时间与滑行距离（两张小图，不共用 y 轴）
+fig, ax = plt.subplots(1, 2, figsize=(12, 3.8))
+xs = [t["trial"] + 1 for t in trials]; cs = [KC[t["kind"]] for t in trials]
+ax[0].bar(xs, [t["coast_ms"] for t in trials], color=cs, width=0.7); ax[0].set_title("断电 → 四轮停转时间"); ax[0].set_ylabel("ms"); ax[0].set_xlabel("测试序号")
+ax[1].bar(xs, [t["coast_mm"] for t in trials], color=cs, width=0.7); ax[1].set_title("断电后滑行距离（轮周）"); ax[1].set_ylabel("mm"); ax[1].set_xlabel("测试序号")
+for a in ax: a.grid(axis="x", visible=False)
+handles = [plt.Rectangle((0, 0), 1, 1, color=KC[k]) for k in KC if any(t["kind"] == k for t in trials)]
+fig.legend(handles, [NAME[k] for k in KC if any(t["kind"] == k for t in trials)], ncol=3, loc="lower center")
+fig.suptitle("图3  断电后车轮自由滑行（车轮架空、无负载）", fontweight="bold"); fig.tight_layout(rect=(0, 0.08, 1, 1))
+figs["fig3_coast"] = fig; plt.show()
+""")
+
+md(r"""
+### 7. 保存
+""")
+
+code(r"""
+# ===== 7. 保存数据 =====
+RUN_DIR = os.path.join(NB_DIR, "watchdog_test_results", "run_" + time.strftime("%Y%m%d_%H%M%S"))
+os.makedirs(RUN_DIR, exist_ok=True)
+with open(os.path.join(RUN_DIR, "samples.csv"), "w", newline="") as fh:
+    w = csv.writer(fh); w.writerow(LOG_COLS); w.writerows([[f"{v:.4f}" if isinstance(v, float) else v for v in r] for r in logs])
+with open(os.path.join(RUN_DIR, "trials.csv"), "w", newline="", encoding="utf-8-sig") as fh:
+    w = csv.writer(fh); ks = list(trials[0].keys()); w.writerow(ks); w.writerows([[t[k] for k in ks] for t in trials])
+def js(v):
+    if isinstance(v, (np.floating, float)): return None if math.isnan(float(v)) else float(v)
+    if isinstance(v, np.integer): return int(v)
+    if isinstance(v, dict): return {k: js(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)): return [js(x) for x in v]
+    return v
+with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as fh:
+    json.dump(js(dict(theory_ms=500.0, params=dict(SPEED=SPEED, RUN_S=RUN_S, HB_PERIOD=HB_PERIOD, LOG_DT=LOG_DT, BAD_MAGIC=hex(BAD_MAGIC)),
+                      precheck=pre, summary=summary, trials=trials)), fh, ensure_ascii=False, indent=2)
+for n, fg in figs.items(): fg.savefig(os.path.join(RUN_DIR, n + ".png"), dpi=150, bbox_inches="tight")
+os.sync() if hasattr(os, "sync") else None
+print("已保存到", RUN_DIR)
+for fn in sorted(os.listdir(RUN_DIR)): print(f"  {fn:<28}{os.path.getsize(os.path.join(RUN_DIR, fn)) / 1024:8.1f} KB")
+""")
+
+md(r"""
+### 8. 保存 notebook（先 Ctrl+S，再运行）
+""")
+
+code(r"""
+import shutil, subprocess
+NB = os.path.join(NB_DIR, "watchdog_timeout_test.ipynb")
+shutil.copy(NB, RUN_DIR)
+r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "html", "--output-dir", RUN_DIR, NB], capture_output=True, text=True)
+print("HTML 报告：", "OK" if r.returncode == 0 else r.stderr[-400:]); os.sync()
+print(sorted(os.listdir(RUN_DIR)))
+""")
+
+nb = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3 (ipykernel)", "language": "python", "name": "python3"},
+      "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}
+for i, c in enumerate(cells): c["id"] = f"cell-{i:02d}"
+json.dump(nb, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+print("wrote", sys.argv[1], len(cells), "cells")

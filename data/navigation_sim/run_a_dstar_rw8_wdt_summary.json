@@ -1,0 +1,24 @@
+{
+  "scenario": "disaster_area",
+  "planner": "D* Lite",
+  "goal": "A",
+  "risk_weight": 8.0,
+  "arrived": true,
+  "arrive_time_s": 36.5,
+  "path_length_m": 11.068,
+  "replans": 19,
+  "safety_stop_events": 1,
+  "collisions": 0,
+  "risk_exposure": 0.002,
+  "blocked_time_s": 0.0,
+  "planner_total_expansions": 1766,
+  "plan_ms_p50": 0.852,
+  "plan_ms_max": 86.221,
+  "wdt_demo": {
+    "hb_stop_t": 10.0,
+    "estop_t": 10.2,
+    "stopped_t": 10.8,
+    "recover_t": 11.0,
+    "hb_loss_to_estop_s": 0.2
+  }
+}
